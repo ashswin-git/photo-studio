@@ -1,8 +1,10 @@
-import { mk, render, outSize, subjectMatrix, subjectBox, boxCorners, aabb, adjust, adjKey, ADJ_KEYS, PRESETS, COLORS, GRADS, TEMPLATES } from './render.js';
+import { mk, render, outSize, subjectMatrix, subjectBox, boxCorners, aabb, adjust, adjKey, ADJ_KEYS, PRESETS, COLORS, GRADS, TEMPLATES, cleanMask, composeSubject, holeFill, oid } from './render.js';
 const $ = id => document.getElementById(id);
 const ai = () => import('./ai.js');
 const view = $('view'), stage = $('stage');
-const MAXSIDE = 2500;
+const MAXSIDE = 2500, PREV = 1600;
+// while a slider is being dragged, skip the edge-refine pass and redo it once the slider settles
+let fastUntil = 0, _ft = 0; function fast() { fastUntil = performance.now() + 250; clearTimeout(_ft); _ft = setTimeout(draw, 300); }
 
 // ---------------- state ----------------
 const defaultStyle = () => ({
@@ -11,7 +13,7 @@ const defaultStyle = () => ({
   shadow: { type: 'soft', op: 35, blur: 35, ang: 90, dist: 20, color: '#000000' },
   refl: { on: false, op: 35, len: 40 },
   outline: { on: false, w: 12, color: '#ffffff' },
-  adj: {}, preset: 'None',
+  adj: {}, preset: 'None', refine: true,
   subj: { x: .5, y: .5, s: 1, rot: 0, fx: 1, fy: 1 },
   layers: []
 });
@@ -41,6 +43,7 @@ async function runCutout(d, label = '') {
   const out = await cutout(blob, (t, f) => busy(`${label}${t}… ${Math.round(f * 100)}%`, f));
   const im = await loadImg(URL.createObjectURL(out));
   const m = mk(d.base.width, d.base.height), x = m.getContext('2d'); x.drawImage(im, 0, 0, m.width, m.height); x.globalCompositeOperation = 'source-in'; x.fillStyle = '#fff'; x.fillRect(0, 0, m.width, m.height);
+  if (S.refine) cleanMask(m);
   d.mask = m; d.hasCut = !!alphaBox(m, 20); d.ver++;
 }
 function fullMask(d) { const m = mk(d.base.width, d.base.height), x = m.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, m.width, m.height); return m; }
@@ -49,22 +52,32 @@ function bboxOf(m) { // fast alpha bbox (subsampled)
   for (let y = 0; y < H; y += 2) for (let X = 0; X < W; X += 2) if (d[(y * W + X) * 4 + 3] > 20) { if (X < a) a = X; if (X > r) r = X; if (y < b) b = y; if (y > t) t = y; }
   return r < 0 ? { x: 0, y: 0, w: W, h: H } : { x: Math.max(0, a - 1), y: Math.max(0, b - 1), w: Math.min(W, r + 2) - Math.max(0, a - 1), h: Math.min(H, t + 2) - Math.max(0, b - 1) };
 }
-// recompute derived canvases (adjusted photo, subject, bbox)
-function refresh(d, st = S, keepBox = false) {
+// recompute derived canvases. Preview uses a downscaled proxy (fast); export uses full resolution.
+function scaled(c, P) { if (P >= 1) return c; const n = mk(c.width * P, c.height * P), x = n.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(c, 0, 0, n.width, n.height); return n; }
+function refresh(d, st = S, o = {}) {
   if (!d) return;
-  const k = adjKey(st.adj) + '|' + d.ver;
-  if (d._k !== k) { d.adj = adjust(d.base, st.adj); d._k = k; d._sk = null; }
-  if (d._sk !== k) {
-    if (d.hasCut && d.mask) { const s = clone(d.adj), x = s.getContext('2d'); x.globalCompositeOperation = 'destination-in'; x.drawImage(d.mask, 0, 0); d.subj = s; } else d.subj = d.adj;
-    d._sk = k; if (!keepBox || !d.bbox) d.bbox = d.hasCut && d.mask ? bboxOf(d.mask) : { x: 0, y: 0, w: d.base.width, h: d.base.height };
+  const full = !!o.full, P = full ? 1 : Math.min(1, PREV / Math.max(d.base.width, d.base.height));
+  const c = full ? (d._F ||= { gen: 0 }) : (d._P ||= { gen: 0 });
+  if (c.base !== d.base) { c.base = d.base; c.sb = scaled(d.base, P); c.adjK = null; }
+  const ak = adjKey(st.adj); if (c.adjK !== ak) { c.adj = adjust(c.sb, st.adj); c.adjK = ak; c.subK = null; }
+  const quick = !!d.painting || (fastUntil > performance.now() && !full);
+  const sk = [oid(d.mask), d.mtick || 0, d.hasCut, st.refine, quick].join('|');
+  if (c.subK !== sk) {
+    c.subK = sk; c.gen++;
+    if (d.hasCut && d.mask) { c.sm = scaled(d.mask, P); c.subj = composeSubject(c.adj, c.sm, st.refine && !quick); } else { c.sm = null; c.subj = c.adj; }
   }
+  d.adj = c.adj; d.subj = c.subj;
+  d.fill = () => { if (c.fillK !== c.gen) { c.fill = c.sm ? holeFill(c.adj, c.sm) : c.adj; c.fillK = c.gen; } return c.fill; };
+  const bk = [oid(d.mask), d.mtick || 0, d.hasCut].join('|');
+  if (!o.keepBox && d._bk !== bk) { d.bbox = d.hasCut && d.mask ? bboxOf(d.mask) : null; d._bk = bk; }
 }
 
 // ---------------- history ----------------
 const hist = { st: [], i: -1 };
 const cloneS = s => ({ ...JSON.parse(JSON.stringify({ ...s, layers: [], bg: { ...s.bg, img: null } })), bg: { ...s.bg }, layers: s.layers.map(l => ({ ...l })) });
-function commit() { if (!doc) return; hist.st = hist.st.slice(0, hist.i + 1); hist.st.push({ S: cloneS(S), base: doc.base, mask: doc.mask, src: doc.src, hasCut: doc.hasCut }); if (hist.st.length > 40) hist.st.shift(); hist.i = hist.st.length - 1; histBtns(); }
-function restore(h) { const c = cloneS(h.S); Object.keys(c).forEach(k => S[k] = c[k]); doc.base = h.base; doc.mask = h.mask; doc.src = h.src; doc.hasCut = h.hasCut; doc.ver++; sel = sel && sel !== 'subject' ? S.layers.find(l => l.id === sel.id) || null : sel; refresh(doc); syncUI(); draw(); }
+let _ct = 0; function commitSoon(ms = 700) { clearTimeout(_ct); _ct = setTimeout(commit, ms); }
+function commit() { clearTimeout(_ct); if (!doc) return; hist.st = hist.st.slice(0, hist.i + 1); hist.st.push({ S: cloneS(S), base: doc.base, mask: doc.mask, src: doc.src, hasCut: doc.hasCut }); if (hist.st.length > 40) hist.st.shift(); hist.i = hist.st.length - 1; histBtns(); }
+function restore(h) { const c = cloneS(h.S); Object.keys(c).forEach(k => S[k] = c[k]); doc.base = h.base; doc.mask = h.mask; doc.src = h.src; doc.hasCut = h.hasCut; doc._bk = null; sel = sel && sel !== 'subject' ? S.layers.find(l => l.id === sel.id) || null : sel; refresh(doc); syncUI(); draw(); }
 function undo() { if (hist.i > 0) { hist.i--; restore(hist.st[hist.i]); histBtns(); } }
 function redo() { if (hist.i < hist.st.length - 1) { hist.i++; restore(hist.st[hist.i]); histBtns(); } }
 function histBtns() { $('undo').disabled = hist.i <= 0; $('redo').disabled = hist.i >= hist.st.length - 1; }
@@ -97,12 +110,12 @@ function viewFit(W, H) {
   return cw / W;
 }
 function paint() {
-  if (!doc) return; refresh(doc, S, tool === 'cutout');
+  if (!doc) return; refresh(doc, S, { keepBox: tool === 'cutout' });
   const ctx = view.getContext('2d');
   if (showOrig) { const sc = viewFit(doc.src.width, doc.src.height); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, view.width, view.height); ctx.drawImage(doc.src, 0, 0, view.width, view.height); return; }
   if (tool === 'crop') return paintCrop();
   const [W, H] = outSize(S, doc), sc = viewFit(W, H);
-  const r = render(view, doc, S, { sc, ghost: tool === 'cutout' }); lastR = r;
+  const r = render(view, doc, S, { sc, ghost: tool === 'cutout', cache: true }); lastR = r;
   ctx.setTransform(sc, 0, 0, sc, 0, 0);
   if (tool === 'retouch' && strokes) { ctx.save(); ctx.transform(r.M.a, r.M.b, r.M.c, r.M.d, r.M.e, r.M.f); ctx.globalAlpha = .55; ctx.drawImage(strokes, 0, 0); ctx.restore(); }
   if (tool === 'move' && sel) {
@@ -118,7 +131,7 @@ function paint() {
 // ---------------- crop tool ----------------
 let crop = null;
 function paintCrop() {
-  const W = doc.adj.width, H = doc.adj.height, sc = viewFit(W, H), ctx = view.getContext('2d');
+  const W = doc.base.width, H = doc.base.height, sc = viewFit(W, H), ctx = view.getContext('2d');
   ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, view.width, view.height); ctx.drawImage(doc.adj, 0, 0, view.width, view.height);
   if (crop) { const c = normRect(crop); ctx.setTransform(sc, 0, 0, sc, 0, 0); ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.rect(c.x, c.y, c.w, c.h); ctx.fill('evenodd'); ctx.strokeStyle = '#fff'; ctx.lineWidth = 2 / sc; ctx.strokeRect(c.x, c.y, c.w, c.h); }
 }
@@ -126,13 +139,13 @@ const normRect = c => ({ x: Math.max(0, Math.min(c.x0, c.x1)), y: Math.max(0, Ma
 function applyCrop() {
   if (!crop) return; const c = normRect(crop); if (c.w < 8 || c.h < 8) return toast('Drag a larger box first');
   const cut = s => { const n = mk(c.w, c.h); n.getContext('2d').drawImage(s, c.x, c.y, c.w, c.h, 0, 0, n.width, n.height); return n; };
-  doc.src = cut(doc.src); doc.base = cut(doc.base); doc.mask = doc.mask && cut(doc.mask); doc.ver++; doc.bbox = null; S.subj = defaultStyle().subj; crop = null; endCrop(); refresh(doc); commit(); draw();
+  doc.src = cut(doc.src); doc.base = cut(doc.base); doc.mask = doc.mask && cut(doc.mask); doc.ver++; doc._bk = null; S.subj = defaultStyle().subj; crop = null; endCrop(); refresh(doc); commit(); draw();
 }
 function endCrop() { tool = 'move'; $('cropApply').hidden = $('cropCancel').hidden = $('cropHint').hidden = true; $('cropStart').hidden = false; draw(); }
 
 // ---------------- pointer interaction ----------------
 const ptrs = new Map(); let drag = null, strokes = null, lastPt = null;
-function evOut(e) { const r = view.getBoundingClientRect(), [W, H] = tool === 'crop' ? [doc.adj.width, doc.adj.height] : outSize(S, doc); return { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H, k: r.width / W }; }
+function evOut(e) { const r = view.getBoundingClientRect(), [W, H] = tool === 'crop' ? [doc.base.width, doc.base.height] : outSize(S, doc); return { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H, k: r.width / W }; }
 function toImg(p) { const M = subjectMatrix(S, doc, ...outSize(S, doc)); const q = M.inverse().transformPoint(new DOMPoint(p.x, p.y)); return { x: q.x, y: q.y, s: Math.hypot(M.a, M.b) }; }
 function hit(p) {
   const [W, H] = outSize(S, doc);
@@ -142,7 +155,8 @@ function hit(p) {
 }
 function brushR() { return +(tool === 'retouch' ? $('rtSize').value : $('cutSize').value) / 2; }
 function stamp(ctx, x, y, r, mode) {
-  const hard = +$('cutHard').value / 100;
+  // Restore uses a firmer edge so it fully undoes an Erase stroke over the same path
+  const hard = mode === 'restore' ? Math.max(.9, +$('cutHard').value / 100) : +$('cutHard').value / 100;
   if (mode === 'retouch') { ctx.fillStyle = '#b388ff'; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); return; }
   const g = ctx.createRadialGradient(x, y, r * hard * .98, x, y, r); g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(1, 'rgba(255,255,255,0)');
   ctx.globalCompositeOperation = mode === 'erase' ? 'destination-out' : 'source-over'; ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); ctx.globalCompositeOperation = 'source-over';
@@ -152,7 +166,7 @@ function paintTo(e) {
   const target = tool === 'retouch' ? strokes : doc.mask, ctx = target.getContext('2d'), mode = tool === 'retouch' ? 'retouch' : cutMode;
   const from = lastPt || q, dist = Math.hypot(q.x - from.x, q.y - from.y), n = Math.max(1, Math.ceil(dist / (r * .3)));
   for (let i = 1; i <= n; i++) stamp(ctx, from.x + (q.x - from.x) * i / n, from.y + (q.y - from.y) * i / n, r, mode);
-  lastPt = q; if (tool === 'cutout') doc._sk = null;
+  lastPt = q; if (tool === 'cutout') doc.mtick = (doc.mtick || 0) + 1;
   draw();
 }
 function hud(e) {
@@ -166,7 +180,7 @@ view.addEventListener('pointerdown', e => {
   if (tool === 'retouch' || tool === 'cutout') {
     if (ptrs.size > 1) return;
     if (tool === 'retouch') { strokes = mk(doc.base.width, doc.base.height); }
-    else { doc.mask = clone(doc.mask); }
+    else { doc.mask = clone(doc.mask); doc.painting = true; }
     lastPt = null; drag = { paint: true }; paintTo(e); return;
   }
   if (ptrs.size === 2 && sel) { const [a, b] = [...ptrs.values()]; drag = { pinch: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY), s0: sel === 'subject' ? S.subj.s : sel.size }; return; }
@@ -176,7 +190,7 @@ view.addEventListener('pointerdown', e => {
 });
 view.addEventListener('pointermove', e => {
   hud(e); if (!drag || !doc) return; ptrs.set(e.pointerId, e);
-  if (drag.crop) { const p = evOut(e); crop.x1 = Math.max(0, Math.min(doc.adj.width, p.x)); crop.y1 = Math.max(0, Math.min(doc.adj.height, p.y)); draw(); return; }
+  if (drag.crop) { const p = evOut(e); crop.x1 = Math.max(0, Math.min(doc.base.width, p.x)); crop.y1 = Math.max(0, Math.min(doc.base.height, p.y)); draw(); return; }
   if (drag.paint) { if (ptrs.size === 1) paintTo(e); return; }
   if (drag.pinch && ptrs.size === 2) { const [a, b] = [...ptrs.values()], k = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) / drag.pinch; setScale(drag.s0 * k); drag.moved = true; return; }
   if (drag.p0) {
@@ -191,7 +205,7 @@ async function endPtr(e) {
   const d = drag; drag = null; guides = null;
   if (d.crop) { draw(); return; }
   if (d.paint) {
-    if (tool === 'cutout') { doc._sk = null; refresh(doc, S, true); commit(); draw(); return; }
+    if (tool === 'cutout') { doc.painting = false; doc.mtick++; refresh(doc, S, { keepBox: true }); commit(); draw(); return; }
     if (tool === 'retouch') await doRetouch();
     return;
   }
@@ -222,7 +236,7 @@ function setTab(t) {
   document.querySelectorAll('.tab').forEach(p => p.hidden = p.dataset.tab !== t);
   const prev = tool; tool = t === 'retouch' ? 'retouch' : t === 'cutout' ? 'cutout' : (tool === 'crop' && t === 'resize' ? 'crop' : 'move');
   if (prev === 'crop' && tool !== 'crop') { crop = null; endCrop(); }
-  if (prev === 'cutout' && tool !== 'cutout' && doc) { doc.ver++; refresh(doc); }
+  if (prev === 'cutout' && tool !== 'cutout' && doc) { doc._bk = null; refresh(doc); }
   stage.classList.toggle('brush', tool === 'retouch' || tool === 'cutout');
   draw();
 }
@@ -234,12 +248,12 @@ const binds = [];
 function bind(id, path, f = 1) {
   const el = $(id), isC = el.type === 'checkbox', isN = el.type === 'range' || el.type === 'number';
   binds.push({ el, path, f, isC, isN });
-  el.addEventListener('input', () => { set(S, path, isC ? el.checked : isN ? +el.value / f : el.value); if (path.startsWith('adj.')) { S.preset = 'None'; markPresets(); } draw(); });
+  el.addEventListener('input', () => { set(S, path, isC ? el.checked : isN ? +el.value / f : el.value); if (path.startsWith('adj.')) { S.preset = 'None'; markPresets(); fast(); } draw(); });
   el.addEventListener('change', commit);
 }
 function syncUI() {
   for (const b of binds) { const v = get(S, b.path); if (b.isC) b.el.checked = !!v; else b.el.value = b.isN ? Math.round((v || 0) * b.f) : v; }
-  segSet('shType', S.shadow.type); markBg(); markPresets(); sizeSel.value = S.size.preset; $('customRow').hidden = S.size.preset !== 'custom'; syncLayerEd();
+  segSet('shType', S.shadow.type); markBg(); markPresets(); sizeSel.value = S.size.preset; $('customRow').hidden = S.size.preset !== 'custom'; if (S.size.w) { $('cw').value = S.size.w; $('ch').value = S.size.h; } $('bgPick').value = S.bg.type === 'color' ? S.bg.color : $('bgPick').value; syncLayerEd(); sizeInfo();
 }
 function seg(id, fn) { $(id).querySelectorAll('button').forEach(b => b.onclick = () => { segSet(id, b.dataset.v); fn(b.dataset.v); }); }
 function segSet(id, v) { $(id).querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.v === v)); }
@@ -254,7 +268,7 @@ document.querySelectorAll('[data-bgmode]').forEach(b => { b.dataset.k = b.datase
 $('bgPick').oninput = e => { setBg({ type: 'color', color: e.target.value }, true); };
 $('bgPick').onchange = commit;
 $('bgFile').onchange = async e => { const f = e.target.files[0]; if (!f) return; const im = await loadImg(URL.createObjectURL(f)); setBg({ type: 'image', img: toCanvas(im, 3000) }); };
-function setBg(o, noCommit) { Object.assign(S.bg, o); markBg(); draw(); if (!noCommit) commit(); }
+function setBg(o, noCommit) { Object.assign(S.bg, o); EX.trans = o.type === 'none'; $('exTrans').checked = EX.trans; exHint(); markBg(); draw(); if (!noCommit) commit(); }
 function bgKey() { const b = S.bg; return b.type === 'color' ? 'c' + b.color : b.type === 'grad' ? 'g' + GRADS.indexOf(b.grad) : b.type === 'template' ? 't' + b.tpl : b.type; }
 function markBg() { const k = bgKey(); document.querySelectorAll('[data-k]').forEach(b => b.classList.toggle('on', b.dataset.k === k)); $('blurRow').hidden = S.bg.type !== 'blur'; }
 bind('bgBlur', 'bg.blur');
@@ -281,7 +295,7 @@ const SIZES = [
 const sizeSel = $('sizePreset'), SZ = {};
 SIZES.forEach(([g, items]) => { const og = document.createElement('optgroup'); og.label = g; items.forEach(([k, l, w, h]) => { SZ[k] = [w || 0, h || 0]; const o = document.createElement('option'); o.value = k; o.textContent = l; og.appendChild(o); }); sizeSel.appendChild(og); });
 sizeSel.onchange = () => { const k = sizeSel.value; S.size.preset = k; if (k === 'custom') { S.size.w = +$('cw').value; S.size.h = +$('ch').value; } else [S.size.w, S.size.h] = SZ[k]; $('customRow').hidden = k !== 'custom'; draw(); commit(); };
-['cw', 'ch'].forEach(id => $(id).onchange = () => { S.size.w = Math.max(16, Math.min(8000, +$('cw').value)); S.size.h = Math.max(16, Math.min(8000, +$('ch').value)); draw(); commit(); });
+['cw', 'ch'].forEach(id => $(id).oninput = () => { const w = +$('cw').value, h = +$('ch').value; if (w < 16 || h < 16) return; S.size.w = Math.min(8000, w); S.size.h = Math.min(8000, h); draw(); commitSoon(); });
 function sizeInfo() { if (!doc) return; const [W, H] = outSize(S, doc); $('sizeInfo').textContent = `Output: ${W} × ${H} px`; $('exInfo').textContent = `Output: ${W * EX.up} × ${H * EX.up} px` + (EX.up > 1 ? ' (AI upscaled)' : ''); }
 bind('pad', 'pad'); bind('sjScale', 'subj.s', 100); bind('sjRot', 'subj.rot');
 $('flipH').onclick = () => { S.subj.fx *= -1; draw(); commit(); };
@@ -293,8 +307,8 @@ $('cropApply').onclick = applyCrop; $('cropCancel').onclick = () => { crop = nul
 
 // cutout tab
 seg('cutMode', v => cutMode = v);
-$('cutRerun').onclick = async () => { if (!doc) return; try { await runCutout(doc, 'Re-running: '); if (!doc.hasCut) doc.mask = fullMask(doc); doc.hasCut = true; doc.bbox = null; refresh(doc); commit(); idle(); draw(); } catch (e) { idle(); toast(e.message); } };
-$('cutFull').onclick = () => { if (!doc) return; doc.mask = fullMask(doc); doc.hasCut = false; doc.ver++; doc.bbox = null; refresh(doc); commit(); draw(); };
+$('cutRerun').onclick = async () => { if (!doc) return; try { await runCutout(doc, 'Re-running: '); if (!doc.hasCut) doc.mask = fullMask(doc); doc.hasCut = true; doc._bk = null; refresh(doc); commit(); idle(); draw(); } catch (e) { idle(); toast(e.message); } };
+$('cutFull').onclick = () => { if (!doc) return; doc.mask = fullMask(doc); doc.hasCut = false; doc._bk = null; refresh(doc); commit(); draw(); };
 
 // retouch tab
 $('rtInfo').innerHTML = '<label class="t">Also cut it out of the product <input type="checkbox" id="rtCut"></label>';
@@ -342,13 +356,17 @@ $('lyUp').onclick = () => { const i = selIdx(); if (i < 0 || i === S.layers.leng
 $('lyDown').onclick = () => { const i = selIdx(); if (i <= 0) return; S.layers.splice(i, 1); S.layers.splice(i - 1, 0, sel); draw(); commit(); };
 
 // ---------------- export ----------------
-$('exFmt').onchange = e => { EX.fmt = e.target.value; $('exQRow').hidden = EX.fmt === 'png'; };
+function exHint() { const j = EX.fmt === 'jpg'; $('exTrans').disabled = j; $('exTransHint').textContent = j ? 'JPG never supports transparency: transparent areas are filled white. Choose PNG or WEBP for a transparent file.' : EX.trans ? `${EX.fmt.toUpperCase()} will keep a transparent background.` : `${EX.fmt.toUpperCase()} will be fully opaque (transparent areas filled white).`; }
+$('exFmt').onchange = e => { EX.fmt = e.target.value; $('exQRow').hidden = EX.fmt === 'png'; exHint(); };
 $('exQRow').hidden = true;
-$('exQ').oninput = e => EX.q = +e.target.value; $('exTrans').onchange = e => EX.trans = e.target.checked;
+$('exQ').oninput = e => EX.q = +e.target.value; $('exTrans').onchange = e => { EX.trans = e.target.checked; exHint(); };
 $('exUp').onchange = e => { EX.up = +e.target.value; sizeInfo(); }; $('exName').oninput = e => EX.name = e.target.value;
 $('scancel').onclick = () => { busyCancel = true; };
 async function renderOut(d, st, withUpscale) {
-  refresh(d, st); const [W, H] = outSize(st, d); let c = mk(W, H); render(c, d, st, { sc: 1, transparent: EX.trans });
+  refresh(d, st, { full: true }); const [W, H] = outSize(st, d); let c = mk(W, H);
+  const trans = EX.trans && EX.fmt !== 'jpg'; render(c, d, st, { sc: 1, transparent: trans });
+  if (!trans) { const f = mk(W, H), x = f.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, W, H); x.drawImage(c, 0, 0); c = f; }
+  refresh(d, st);
   let f = withUpscale ? EX.up : 1; while (f > 1 && Math.max(W, H) * f > 8192) f /= 2;
   if (withUpscale && f !== EX.up) toast(f > 1 ? `Image too large for ${EX.up}×, using ${f}×` : 'Image too large to upscale; exporting at 1×');
   if (f > 1) { busyCancel = false; const { upscale } = await ai(); c = await upscale(c, f, (t, p) => busy(t, p, true), () => busyCancel); }
@@ -418,4 +436,7 @@ window.addEventListener('keydown', e => {
   else if ((e.key === 'Delete' || e.key === 'Backspace') && sel && sel !== 'subject') $('lyDel').click();
 });
 new ResizeObserver(draw).observe(stage);
+document.fonts.addEventListener('loadingdone', draw);
+bind('cutRefine', 'refine');
+exHint();
 syncUI();

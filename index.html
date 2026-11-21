@@ -85,6 +85,7 @@
       <div class="seg" id="cutMode"><button data-v="erase" class="on">Erase</button><button data-v="restore">Restore</button></div>
       <label class="t">Brush size <input type="range" id="cutSize" min="2" max="150" value="30"></label>
       <label class="t">Hardness <input type="range" id="cutHard" min="0" max="100" value="70"></label>
+      <label class="t">Refine edges (clean specks, soften &amp; decontaminate edges) <input type="checkbox" id="cutRefine" checked></label>
       <div class="row"><button class="btn ghost sm" id="cutRerun">Re-run AI cutout</button><button class="btn ghost sm" id="cutFull">Keep whole photo</button></div>
     </div>
 
@@ -180,6 +181,7 @@
       <label class="t">Format <select id="exFmt"><option value="png">PNG</option><option value="jpg">JPG</option><option value="webp">WEBP</option></select></label>
       <label class="t" id="exQRow">Quality <input type="range" id="exQ" min="40" max="100" value="92"></label>
       <label class="t">Transparent background <input type="checkbox" id="exTrans"></label>
+      <p class="hint" id="exTransHint"></p>
       <label class="t">AI upscale <select id="exUp"><option value="1">Off (1×)</option><option value="2">2× (Real-ESRGAN)</option><option value="4">4× (Real-ESRGAN)</option></select></label>
       <label class="t">File name <input type="text" id="exName" value="photo-studio"></label>
       <div class="hint" id="exInfo"></div>
