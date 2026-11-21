@@ -1,5 +1,5 @@
 // Rendering engine: background, scenes, shadows, reflection, outline, subject, overlay layers.
-export const mk = (w, h) => { const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(w)); c.height = Math.max(1, Math.round(h)); return c; };
+export const mk = (w, h) => { w = Math.max(1, Math.round(w)); h = Math.max(1, Math.round(h)); if (typeof document === 'undefined') return new OffscreenCanvas(w, h); const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
 
 // ---------- adjustments ----------
 export const ADJ_KEYS = [
@@ -120,23 +120,75 @@ export function cleanMask(m, frac = 0.015) {
   }
   x.putImageData(id, 0, 0); return { removed };
 }
-// subject = photo masked; refine: slight alpha erode/feather + colour decontamination of edge pixels
+// subject = photo masked. refine (default on):
+//  - background-colour suppression: mask pixels whose colour matches the local background (e.g. yellow showing
+//    through gaps inside a headband) are faded out. Skipped automatically when the product itself is close to the
+//    background colour (e.g. red shoe on red), so the product is never eaten.
+//  - edge decontamination: semi-transparent edge pixels are un-mixed from the background colour
+//    F = (I - (1-a)·B) / a and blended towards nearby interior colour, removing coloured halos.
+//  - slight alpha erode + feather.
+function rd2(c, W, H) { const t = mk(W, H), x = t.getContext('2d', { willReadFrequently: true }); x.drawImage(c, 0, 0); return x.getImageData(0, 0, W, H); }
 export function composeSubject(adj, mask, refine) {
-  const W = adj.width, H = adj.height, s = mk(W, H), sx = s.getContext('2d', { willReadFrequently: true });
+  const W = adj.width, H = adj.height, s = mk(W, H), sx = s.getContext('2d');
   if (!refine) { sx.drawImage(adj, 0, 0); sx.globalCompositeOperation = 'destination-in'; sx.drawImage(mask, 0, 0, W, H); return s; }
+  const rd = c => c.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, W, H).data;
   const mc = mk(W, H), mx = mc.getContext('2d', { willReadFrequently: true }); mx.filter = `blur(${Math.max(.4, W / 2400).toFixed(2)}px)`; mx.drawImage(mask, 0, 0, W, H);
-  const md = mx.getImageData(0, 0, W, H).data;
-  sx.drawImage(adj, 0, 0); const id = sx.getImageData(0, 0, W, H), d = id.data;
-  // interior colours spread outwards (premultiplied blur of the solid interior)
+  const md = rd(mc);
+  const id = rd2(adj, W, H), d = id.data;
+  const bd = rd(holeFill(adj, mask)); // local background colour estimate everywhere
+  // interior colour spread outwards
   const ic = mk(W, H), ix = ic.getContext('2d', { willReadFrequently: true }), iid = ix.createImageData(W, H), idd = iid.data;
-  for (let i = 0; i < d.length; i += 4) { if (md[i + 3] >= 235) { idd[i] = d[i]; idd[i + 1] = d[i + 1]; idd[i + 2] = d[i + 2]; idd[i + 3] = 255; } }
+  for (let i = 0; i < d.length; i += 4) if (md[i + 3] >= 235) { idd[i] = d[i]; idd[i + 1] = d[i + 1]; idd[i + 2] = d[i + 2]; idd[i + 3] = 255; }
   ix.putImageData(iid, 0, 0);
-  const bc = mk(W, H), bx = bc.getContext('2d', { willReadFrequently: true }); bx.filter = `blur(${Math.max(2, W / 300).toFixed(1)}px)`; bx.drawImage(ic, 0, 0); const bd = bx.getImageData(0, 0, W, H).data;
-  for (let i = 0; i < d.length; i += 4) {
-    const a0 = md[i + 3]; let a = (a0 - 40) * 255 / 200; a = a < 0 ? 0 : a > 255 ? 255 : a; // erode + re-feather
-    if (a > 0 && a < 250 && bd[i + 3] > 8) { const t = 1 - a / 255 * 0.6; d[i] += (bd[i] - d[i]) * t; d[i + 1] += (bd[i + 1] - d[i + 1]) * t; d[i + 2] += (bd[i + 2] - d[i + 2]) * t; }
-    d[i + 3] = a;
+  const ec = mk(W, H), ex = ec.getContext('2d', { willReadFrequently: true }); ex.filter = `blur(${Math.max(2, W / 250).toFixed(1)}px)`; ex.drawImage(ic, 0, 0); const ed = ex.getImageData(0, 0, W, H).data;
+  // closeness of a pixel to the local background colour, 0..1: plain RGB distance, or — for a saturated backdrop —
+  // the same hue at a lower brightness (the backdrop in shadow, e.g. darker yellow under a headband)
+  const cl = i => {
+    const r = d[i], g = d[i + 1], b = d[i + 2], R = bd[i], G = bd[i + 1], B = bd[i + 2];
+    const dd = Math.hypot(r - R, g - G, b - B); let c = dd <= 26 ? 1 : dd >= 60 ? 0 : (60 - dd) / 34;
+    const nB = Math.hypot(R, G, B), nP = Math.hypot(r, g, b);
+    if (c < 1 && nB > 60 && Math.max(R, G, B) - Math.min(R, G, B) > 60 && nP > nB * .3 && nP < nB * 1.25) {
+      const ang = Math.acos(Math.min(1, (r * R + g * G + b * B) / (nB * nP)));
+      c = Math.max(c, ang <= .06 ? 1 : ang >= .13 ? 0 : (.13 - ang) / .07);
+    }
+    return c;
+  };
+  let inner = 0, close = 0;
+  for (let i = 0; i < d.length; i += 16) if (md[i + 3] >= 250) { inner++; if (cl(i) >= .99) close++; }
+  const suppress = inner > 0 && close / inner < 0.04;
+  // only remove *regions* of background colour (an enclosed gap, a halo band) — never isolated pixels or speckles
+  // inside the product (a red knit on a red backdrop has many pixels close to the background colour)
+  let rg = null;
+  if (suppress) {
+    const cc = mk(W, H), cx = cc.getContext('2d', { willReadFrequently: true }), cid = cx.createImageData(W, H), cd = cid.data;
+    for (let i = 0; i < d.length; i += 4) if (md[i + 3]) cd[i + 3] = 255 * cl(i);
+    cx.putImageData(cid, 0, 0);
+    const rc = mk(W, H), rx = rc.getContext('2d', { willReadFrequently: true }); rx.filter = `blur(${Math.max(2, W / 220).toFixed(1)}px)`; rx.drawImage(cc, 0, 0); rg = rx.getImageData(0, 0, W, H).data;
   }
+  for (let i = 0; i < d.length; i += 4) {
+    let a = md[i + 3]; if (!a) { d[i + 3] = 0; continue; }
+    if (rg) { const r = rg[i + 3] / 255, f = r <= .6 ? 0 : r >= .85 ? 1 : (r - .6) / .25; if (f > 0) a *= 1 - f * cl(i); }
+    let A = (a - 40) * 255 / 200; A = A < 0 ? 0 : A > 255 ? 255 : A; // erode + re-feather
+    if (A > 0 && A < 250) {
+      const al = Math.max(.08, a / 255);
+      for (let k = 0; k < 3; k++) {
+        let f = (d[i + k] - (1 - al) * bd[i + k]) / al; f = f < 0 ? 0 : f > 255 ? 255 : f; // un-mix from background
+        const t = ed[i + 3] > 8 ? (1 - A / 255) * .7 : 0; d[i + k] = f + ((ed[i + 3] > 8 ? ed[i + k] : f) - f) * t;
+      }
+    }
+    if (suppress && A > 0) { // spill removal: take the backdrop's colour cast out of edges and dark, reflective surfaces
+      const R = bd[i], G = bd[i + 1], B = bd[i + 2], mB = (R + G + B) / 3, cR = R - mB, cG = G - mB, cB = B - mB, n2 = cR * cR + cG * cG + cB * cB;
+      if (n2 > 900) {
+        const r = d[i], g = d[i + 1], b = d[i + 2], mP = (r + g + b) / 3, t = ((r - mP) * cR + (g - mP) * cG + (b - mP) * cB) / n2;
+        if (t > 0) {
+          const lum = mP / Math.max(1, mB), w = Math.max(A < 250 ? 1 : 0, Math.min(1, Math.max(0, (1 - lum) / .25))) * .9;
+          d[i] = Math.max(0, r - t * cR * w); d[i + 1] = Math.max(0, g - t * cG * w); d[i + 2] = Math.max(0, b - t * cB * w);
+        }
+      }
+    }
+    d[i + 3] = A;
+  }
+  composeSubject.last = { suppress, close: inner ? close / inner : 0 };
   sx.putImageData(id, 0, 0); return s;
 }
 // photo with the product area filled from its surroundings (push-pull), used for blurred backgrounds
@@ -144,9 +196,10 @@ export function holeFill(adj, mask) {
   const W = adj.width, H = adj.height, b = mk(W, H), x = b.getContext('2d'); x.drawImage(adj, 0, 0);
   x.globalCompositeOperation = 'destination-out'; const r = Math.max(2, Math.round(W / 150));
   x.drawImage(mask, 0, 0, W, H); x.filter = `blur(${r}px)`; for (let i = 0; i < 3; i++) x.drawImage(mask, 0, 0, W, H);
-  const lv = [b]; while (lv[lv.length - 1].width > 8 && lv[lv.length - 1].height > 8) { const p = lv[lv.length - 1], c = mk(p.width / 2, p.height / 2); c.getContext('2d').drawImage(p, 0, 0, c.width, c.height); lv.push(c); }
-  const o = mk(W, H), ox = o.getContext('2d'); ox.imageSmoothingQuality = 'high';
-  for (let k = 0; k < 6; k++) ox.drawImage(lv[lv.length - 1], 0, 0, W, H);
+  // pyramid down to 1x1; start from the opaque average colour so no pixel is ever left transparent
+  const lv = [b]; while (lv[lv.length - 1].width > 1 || lv[lv.length - 1].height > 1) { const p = lv[lv.length - 1], c = mk(Math.max(1, p.width / 2), Math.max(1, p.height / 2)); c.getContext('2d').drawImage(p, 0, 0, c.width, c.height); lv.push(c); }
+  const avg = lv[lv.length - 1].getContext('2d').getImageData(0, 0, 1, 1).data;
+  const o = mk(W, H), ox = o.getContext('2d'); ox.imageSmoothingQuality = 'high'; ox.fillStyle = `rgb(${avg[0]},${avg[1]},${avg[2]})`; ox.fillRect(0, 0, W, H);
   for (let i = lv.length - 2; i >= 0; i--) ox.drawImage(lv[i], 0, 0, W, H);
   return o;
 }
@@ -187,11 +240,27 @@ function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >
 function tint(src, color) { const c = mk(src.width, src.height), x = c.getContext('2d'); x.drawImage(src, 0, 0); x.globalCompositeOperation = 'source-in'; x.fillStyle = color; x.fillRect(0, 0, c.width, c.height); return c; }
 
 // ---------- background ----------
-function drawPhotoBg(ctx, img, DM, W0, H0, blurPx, DW, DH) {
-  // blurred, edge-extended copy covers the whole canvas; then the photo aligned with the product
-  const sc = img.width / W0, e = extend(img, Math.round(Math.max(img.width, img.height) * .6));
-  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.filter = `blur(${Math.max(blurPx, 2)}px)`;
-  ctx.setTransform(DM); ctx.drawImage(e.c, -e.p / sc, -e.p / sc, e.c.width / sc, e.c.height / sc); ctx.restore();
+// photo copy whose borders fade out, so an aligned photo blends into the fill without seams or streaks
+const _feather = new WeakMap();
+function feathered(img) {
+  let f = _feather.get(img); if (f) return f;
+  const w = img.width, h = img.height, e = Math.max(2, Math.round(Math.min(w, h) * .06));
+  f = mk(w, h); const x = f.getContext('2d'); x.drawImage(img, 0, 0); x.globalCompositeOperation = 'destination-in';
+  const m = mk(w, h), mx = m.getContext('2d'); mx.fillStyle = '#fff'; mx.fillRect(0, 0, w, h); mx.globalCompositeOperation = 'destination-in';
+  const g1 = mx.createLinearGradient(0, 0, w, 0); g1.addColorStop(0, 'rgba(0,0,0,0)'); g1.addColorStop(e / w, '#000'); g1.addColorStop(1 - e / w, '#000'); g1.addColorStop(1, 'rgba(0,0,0,0)'); mx.fillStyle = g1; mx.fillRect(0, 0, w, h);
+  const g2 = mx.createLinearGradient(0, 0, 0, h); g2.addColorStop(0, 'rgba(0,0,0,0)'); g2.addColorStop(e / h, '#000'); g2.addColorStop(1 - e / h, '#000'); g2.addColorStop(1, 'rgba(0,0,0,0)'); mx.fillStyle = g2; mx.fillRect(0, 0, w, h);
+  x.drawImage(m, 0, 0); _feather.set(img, f); return f;
+}
+// Blurred photo background. Work happens on a 1/4-size canvas (blur hides the difference) so it stays fast.
+// 1) the product-free photo, cover-fitted and heavily blurred, fills the whole canvas (no streaks, no dark edges)
+// 2) the same photo aligned with the product (blurred when blurPx>0, faded borders) sits on top
+function drawPhotoBg(ctx, fill, DM, W0, H0, blurPx, DW, DH) {
+  const q = .25, lw = Math.max(8, Math.round(DW * q)), lh = Math.max(8, Math.round(DH * q)), lo = mk(lw, lh), lx = lo.getContext('2d');
+  const big = Math.max(lw, lh) / 12, iw = fill.width, ih = fill.height, k = Math.max((lw + 4 * big) / iw, (lh + 4 * big) / ih);
+  lx.filter = `blur(${big.toFixed(1)}px)`; lx.drawImage(fill, (lw - iw * k) / 2, (lh - ih * k) / 2, iw * k, ih * k);
+  lx.filter = blurPx > 0 ? `blur(${Math.max(.5, blurPx * q).toFixed(1)}px)` : 'none';
+  lx.setTransform(new DOMMatrix([q * lw / (DW * q), 0, 0, q * lh / (DH * q), 0, 0]).multiply(DM)); lx.drawImage(feathered(fill), 0, 0, W0, H0);
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.imageSmoothingQuality = 'high'; ctx.drawImage(lo, 0, 0, DW, DH); ctx.restore();
 }
 function drawBackground(ctx, S, p, doc, DM) {
   const b = S.bg, W = p.W, H = p.H, W0 = doc.base.width, H0 = doc.base.height;
@@ -200,8 +269,9 @@ function drawBackground(ctx, S, p, doc, DM) {
   else if (b.type === 'grad') { ctx.fillStyle = lin(ctx, 0, 0, W, H, [[0, b.grad[0]], [1, b.grad[1]]]); ctx.fillRect(0, 0, W, H); }
   else if (b.type === 'image' && b.img) cover(ctx, b.img, W, H);
   else if (b.type === 'template') (TEMPLATES[b.tpl] || TEMPLATES['Studio white'])(ctx, p);
-  else if (b.type === 'blur') drawPhotoBg(ctx, doc.fill ? doc.fill() : doc.adj, DM, W0, H0, (b.blur || 4) * Math.max(W, H) / 400 * p.sc);
-  else if (b.type === 'orig') { drawPhotoBg(ctx, doc.fill ? doc.fill() : doc.adj, DM, W0, H0, Math.max(W, H) / 60 * p.sc); ctx.save(); ctx.setTransform(DM); ctx.drawImage(doc.adj, 0, 0, W0, H0); ctx.restore(); }
+  else if (b.type === 'blur') drawPhotoBg(ctx, doc.fill ? doc.fill() : doc.adj, DM, W0, H0, (b.blur || 4) * Math.max(W, H) / 400 * p.sc, p.DW, p.DH);
+  else if (b.type === 'orig') { drawPhotoBg(ctx, doc.fill ? doc.fill() : doc.adj, DM, W0, H0, Math.max(W, H) / 60 * p.sc, p.DW, p.DH); const c = boxCorners(DM, { x: 0, y: 0, w: W0, h: H0 }), r = aabb(c), covers = !(DM.b || DM.c) && r.x <= 1 && r.y <= 1 && r.x + r.w >= p.DW - 1 && r.y + r.h >= p.DH - 1;
+    ctx.save(); ctx.setTransform(DM); ctx.drawImage(covers ? doc.adj : feathered(doc.adj), 0, 0, W0, H0); ctx.restore(); }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
 }
 
@@ -212,13 +282,13 @@ export function render(target, doc, S, opts = {}) {
   const ctx = target.getContext('2d'); const DW = target.width, DH = target.height;
   ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, DW, DH);
   const M = subjectMatrix(S, doc, W, H), bx = subjectBox(S, doc), R = aabb(boxCorners(M, bx));
-  const p = { W, H, sc, fy: Math.min(R.y + R.h, H), cx: R.x + R.w / 2, sw: R.w };
+  const p = { W, H, sc, DW, DH, fy: Math.min(R.y + R.h, H), cx: R.x + R.w / 2, sw: R.w };
   const DM = new DOMMatrix([sc, 0, 0, sc, 0, 0]).multiply(M);
   const Ms = DM.toString(), keep = keepsBg(S), transparent = opts.transparent || S.bg.type === 'none';
   const cache = opts.cache ? (target.__c ||= {}) : {};
   // background (cached)
   if (!transparent) {
-    const b = S.bg, bk = [DW, DH, b.type, b.color, b.grad, b.tpl, oid(b.img), b.blur, oid(doc.adj), oid(doc.subj), (b.type === 'template' || keep) ? Ms : ''].join('|');
+    const b = S.bg, bk = [DW, DH, b.type, b.color, b.grad, b.tpl, oid(b.img), b.blur, keep ? oid(doc.adj) + ':' + (doc.fgen || 0) : '', (b.type === 'template' || keep) ? Ms : ''].join('|');
     if (cache.bk !== bk) { cache.bg = mk(DW, DH); drawBackground(cache.bg.getContext('2d'), S, p, doc, DM); cache.bk = bk; }
     ctx.drawImage(cache.bg, 0, 0);
   }
@@ -268,11 +338,15 @@ function effects(doc, S, p, DM, DW, DH, R, isCut) {
       ctx.restore();
     }
     if (olr > 0) {
-      const t = tint(L, S.outline.color), n = Math.max(16, Math.min(48, Math.round(olr * 2)));
+      // work only on the product's bounding box (+ outline margin), not the whole canvas
+      const bx0 = Math.max(0, Math.floor(R.x * sc + m - 2)), by0 = Math.max(0, Math.floor(R.y * sc + m - 2));
+      const bw = Math.min(L.width - bx0, Math.ceil(R.w * sc + 4)), bh = Math.min(L.height - by0, Math.ceil(R.h * sc + 4));
+      const Lc = mk(Math.max(1, bw), Math.max(1, bh)); Lc.getContext('2d').drawImage(L, -bx0, -by0);
+      const t = tint(Lc, S.outline.color), n = Math.max(12, Math.min(32, Math.round(olr * 1.5)));
       // clip to the photo's own rectangle so edges cut by the photo border / crop get no outline
       const q = [[0, 0], [W0, 0], [W0, H0], [0, H0]].map(([x, y]) => DM.transformPoint(new DOMPoint(x, y)));
       ctx.save(); ctx.beginPath(); q.forEach((pt, i) => i ? ctx.lineTo(pt.x, pt.y) : ctx.moveTo(pt.x, pt.y)); ctx.closePath(); ctx.clip();
-      for (let i = 0; i < n; i++) { const a = i / n * Math.PI * 2; ctx.drawImage(t, -m + Math.cos(a) * olr, -m + Math.sin(a) * olr); }
+      for (let i = 0; i < n; i++) { const a = i / n * Math.PI * 2; ctx.drawImage(t, bx0 - m + Math.cos(a) * olr, by0 - m + Math.sin(a) * olr); }
       ctx.restore();
     }
   }

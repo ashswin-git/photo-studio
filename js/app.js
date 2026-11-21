@@ -3,8 +3,28 @@ const $ = id => document.getElementById(id);
 const ai = () => import('./ai.js');
 const view = $('view'), stage = $('stage');
 const MAXSIDE = 2500, PREV = 1600;
-// while a slider is being dragged, skip the edge-refine pass and redo it once the slider settles
-let fastUntil = 0, _ft = 0; function fast() { fastUntil = performance.now() + 250; clearTimeout(_ft); _ft = setTimeout(draw, 300); }
+// Edge refinement is the only heavy per-change step; in the editor it runs in a worker (latest request wins),
+// the preview shows a quick cut-out meanwhile. Falls back to an idle-time main-thread pass if workers can't do it.
+let worker = null, wOK = typeof OffscreenCanvas !== 'undefined' && typeof createImageBitmap !== 'undefined', wid = 0;
+const wJobs = new Map();
+function getWorker() {
+  if (!wOK) return null;
+  if (!worker) { try { worker = new Worker(new URL('./refine-worker.js', import.meta.url), { type: 'module' }); worker.onmessage = onWorker; worker.onerror = () => { wOK = false; worker = null; wJobs.forEach(j => j.fallback()); wJobs.clear(); }; } catch { wOK = false; return null; } }
+  return worker;
+}
+function onWorker(e) {
+  const { id, bmp, err } = e.data, j = wJobs.get(id); wJobs.delete(id); if (!j) return;
+  if (err || !bmp) { wOK = false; return j.fallback(); }
+  const c = mk(bmp.width, bmp.height); c.getContext('2d').drawImage(bmp, 0, 0); bmp.close?.(); j.done(c);
+}
+function refineAsync(c, sk) {
+  const apply = s => { if (c.subK === sk) { c.subj = s; c.refined = sk; c.busy = false; if (doc && doc._P === c) { doc.subj = s; draw(); } } else c.busy = false; pump(c); };
+  const fallback = () => setTimeout(() => { if (c.subK === sk) apply(composeSubject(c.adj, c.sm, true)); else { c.busy = false; pump(c); } }, 30);
+  c.busy = true; const w = getWorker(); if (!w) return fallback();
+  const id = ++wid; wJobs.set(id, { done: apply, fallback });
+  Promise.all([createImageBitmap(c.adj), createImageBitmap(c.sm)]).then(([adj, mask]) => w.postMessage({ id, adj, mask }, [adj, mask])).catch(() => { wJobs.delete(id); fallback(); });
+}
+function pump(c) { if (!c.busy && c.want && c.want === c.subK && c.refined !== c.subK) refineAsync(c, c.subK); }
 
 // ---------------- state ----------------
 const defaultStyle = () => ({
@@ -60,14 +80,17 @@ function refresh(d, st = S, o = {}) {
   const c = full ? (d._F ||= { gen: 0 }) : (d._P ||= { gen: 0 });
   if (c.base !== d.base) { c.base = d.base; c.sb = scaled(d.base, P); c.adjK = null; }
   const ak = adjKey(st.adj); if (c.adjK !== ak) { c.adj = adjust(c.sb, st.adj); c.adjK = ak; c.subK = null; }
-  const quick = !!d.painting || (fastUntil > performance.now() && !full);
-  const sk = [oid(d.mask), d.mtick || 0, d.hasCut, st.refine, quick].join('|');
+  const painting = !!d.painting && !full;
+  const sk = [oid(d.mask), d.mtick || 0, d.hasCut, st.refine, painting, c.adjK].join('|');
   if (c.subK !== sk) {
+    const mk2 = [oid(d.mask), d.mtick || 0, d.hasCut].join('|'); if (c.smK !== mk2) { c.sm = d.hasCut && d.mask ? scaled(d.mask, P) : null; c.smK = mk2; }
     c.subK = sk; c.gen++;
-    if (d.hasCut && d.mask) { c.sm = scaled(d.mask, P); c.subj = composeSubject(c.adj, c.sm, st.refine && !quick); } else { c.sm = null; c.subj = c.adj; }
+    if (!c.sm) c.subj = c.adj;
+    else if (full || !st.refine) c.subj = composeSubject(c.adj, c.sm, st.refine);
+    else { c.subj = composeSubject(c.adj, c.sm, false); if (!painting) { c.want = sk; pump(c); } }
   }
-  d.adj = c.adj; d.subj = c.subj;
-  d.fill = () => { if (c.fillK !== c.gen) { c.fill = c.sm ? holeFill(c.adj, c.sm) : c.adj; c.fillK = c.gen; } return c.fill; };
+  d.adj = c.adj; d.subj = c.subj; d.fgen = c.gen;
+  d.fill = () => { if (c.fillK !== c.gen) { const k = Math.min(1, 640 / Math.max(c.adj.width, c.adj.height)); c.fill = c.sm ? holeFill(scaled(c.adj, k), scaled(c.sm, k)) : c.adj; /* blurred anyway: low-res is enough */ c.fillK = c.gen; } return c.fill; };
   const bk = [oid(d.mask), d.mtick || 0, d.hasCut].join('|');
   if (!o.keepBox && d._bk !== bk) { d.bbox = d.hasCut && d.mask ? bboxOf(d.mask) : null; d._bk = bk; }
 }
@@ -87,7 +110,14 @@ function redo() { flushCommit(); if (hist.i < hist.st.length - 1) { hist.i++; re
 function histBtns() { $('undo').disabled = hist.i <= 0; $('redo').disabled = hist.i >= hist.st.length - 1; }
 
 // ---------------- start / load ----------------
+let pendingReset = false;
+function resetAll() {
+  const d = defaultStyle(); Object.keys(d).forEach(k => S[k] = d[k]);
+  Object.assign(EX, { fmt: 'png', q: 92, trans: false, up: 1 }); $('exFmt').value = 'png'; $('exQ').value = 92; $('exTrans').checked = false; $('exUp').value = '1'; $('exQRow').hidden = true;
+  $('cw').value = 1080; $('ch').value = 1080; sel = null; strokes = null; crop = null; cutMode = 'erase'; segSet('cutMode', 'erase'); setTab('bg'); syncUI(); exHint();
+}
 async function start(file) {
+  if (pendingReset || !doc) { resetAll(); pendingReset = false; }
   try {
     busy('Reading photo…', .02);
     const d = await newDoc(file); doc = d; EX.name = d.name + '-studio'; $('exName').value = EX.name;
@@ -110,16 +140,19 @@ let showOrig = false, lastR = null, guides = null;
 function viewFit(W, H) {
   const r = stage.getBoundingClientRect(), mw = Math.max(50, r.width - 28), mh = Math.max(50, r.height - 28), k = Math.min(mw / W, mh / H), dpr = Math.min(2, devicePixelRatio || 1);
   view.style.width = Math.round(W * k) + 'px'; view.style.height = Math.round(H * k) + 'px';
-  const cw = Math.round(W * k * dpr), ch = Math.round(H * k * dpr); if (view.width !== cw || view.height !== ch) { view.width = cw; view.height = ch; }
+  const px = W * k * dpr * H * k * dpr, cap = px > 1.6e6 ? Math.sqrt(1.6e6 / px) : 1; // keep the preview canvas ≤1.6 MP
+  const cw = Math.round(W * k * dpr * cap), ch = Math.round(H * k * dpr * cap); if (view.width !== cw || view.height !== ch) { view.width = cw; view.height = ch; }
   return cw / W;
 }
-function paint() {
-  if (!doc) return; refresh(doc, S, { keepBox: tool === 'cutout' });
+const perf = { last: 0, max: 0, n: 0 }; window.__ps.perf = perf;
+function paint() { const t0 = performance.now(); paint_(); const dt = performance.now() - t0; perf.last = dt; if (dt > perf.max) { perf.max = dt; perf.worst = { refresh: perf.refresh, render: perf.render, tool }; } perf.n++; }
+function paint_() {
+  if (!doc) return; const t0 = performance.now(); refresh(doc, S, { keepBox: tool === 'cutout' }); perf.refresh = performance.now() - t0;
   const ctx = view.getContext('2d');
   if (showOrig) { const sc = viewFit(doc.src.width, doc.src.height); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, view.width, view.height); ctx.drawImage(doc.src, 0, 0, view.width, view.height); return; }
   if (tool === 'crop') return paintCrop();
   const [W, H] = outSize(S, doc), sc = viewFit(W, H);
-  const r = render(view, doc, S, { sc, ghost: tool === 'cutout', cache: true }); lastR = r;
+  const t1 = performance.now(); const r = render(view, doc, S, { sc, ghost: tool === 'cutout', cache: true }); lastR = r; perf.render = performance.now() - t1;
   ctx.setTransform(sc, 0, 0, sc, 0, 0);
   if (tool === 'retouch' && strokes) { ctx.save(); ctx.transform(r.M.a, r.M.b, r.M.c, r.M.d, r.M.e, r.M.f); ctx.globalAlpha = .55; ctx.drawImage(strokes, 0, 0); ctx.restore(); }
   if (tool === 'move' && sel) {
@@ -252,7 +285,7 @@ const binds = [];
 function bind(id, path, f = 1) {
   const el = $(id), isC = el.type === 'checkbox', isN = el.type === 'range' || el.type === 'number';
   binds.push({ el, path, f, isC, isN });
-  el.addEventListener('input', () => { set(S, path, isC ? el.checked : isN ? +el.value / f : el.value); if (path.startsWith('adj.')) { S.preset = 'None'; markPresets(); fast(); } draw(); });
+  el.addEventListener('input', () => { set(S, path, isC ? el.checked : isN ? +el.value / f : el.value); if (path.startsWith('adj.')) { S.preset = 'None'; markPresets(); } draw(); });
   el.addEventListener('change', commit);
 }
 function syncUI() {
@@ -425,7 +458,7 @@ $('batchRun').onclick = async () => {
 // ---------------- top bar, upload, keyboard ----------------
 $('undo').onclick = undo; $('redo').onclick = redo;
 const cmp = $('compare'); cmp.addEventListener('pointerdown', () => { showOrig = true; draw(); }); ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => cmp.addEventListener(ev, () => { if (showOrig) { showOrig = false; draw(); } }));
-$('newphoto').onclick = () => $('file').click();
+$('newphoto').onclick = () => { pendingReset = true; $('file').click(); };
 $('pick').onclick = e => { e.stopPropagation(); $('file').click(); };
 $('pickmany').onclick = e => { e.stopPropagation(); $('files').click(); };
 $('drop').onclick = e => { if (e.target.tagName !== 'IMG') $('file').click(); };
