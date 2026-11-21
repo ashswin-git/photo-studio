@@ -20,7 +20,7 @@ const defaultStyle = () => ({
 const S = defaultStyle();
 const EX = { fmt: 'png', q: 92, trans: false, up: 1, name: 'photo-studio' };
 let doc = null, tool = 'move', sel = null, tab = 'bg', cutMode = 'erase', busyCancel = false;
-window.__ps = { S, EX, get doc() { return doc; } }; // for debugging / tests
+window.__ps = { S, EX, get doc() { return doc; }, get hist() { return hist.st.map(h => h.S.size.preset + ':' + h.S.size.w + 'x' + h.S.size.h).concat(['i=' + hist.i]); } }; // for debugging / tests
 
 // ---------------- helpers ----------------
 function toast(msg, ms = 3200) { const t = document.createElement('div'); t.className = 'toast'; t.textContent = msg; document.body.appendChild(t); setTimeout(() => t.remove(), ms); }
@@ -75,11 +75,15 @@ function refresh(d, st = S, o = {}) {
 // ---------------- history ----------------
 const hist = { st: [], i: -1 };
 const cloneS = s => ({ ...JSON.parse(JSON.stringify({ ...s, layers: [], bg: { ...s.bg, img: null } })), bg: { ...s.bg }, layers: s.layers.map(l => ({ ...l })) });
-let _ct = 0; function commitSoon(ms = 700) { clearTimeout(_ct); _ct = setTimeout(commit, ms); }
-function commit() { clearTimeout(_ct); if (!doc) return; hist.st = hist.st.slice(0, hist.i + 1); hist.st.push({ S: cloneS(S), base: doc.base, mask: doc.mask, src: doc.src, hasCut: doc.hasCut }); if (hist.st.length > 40) hist.st.shift(); hist.i = hist.st.length - 1; histBtns(); }
+// W/H edits typed in quick succession (one burst, <600 ms apart) become one history step; a pause, undo/redo or any other edit ends the burst
+let _ct = 0, _pending = false;
+function commitSoon(ms = 600) { clearTimeout(_ct); _pending = true; _ct = setTimeout(flushCommit, ms); }
+function flushCommit() { if (_pending) commit(); }
+const sig = h => JSON.stringify(h.S, (k, v) => (k[0] === '_' || k === 'img') ? undefined : v) + '|' + [h.base, h.mask, h.src].map(oid).join(',') + h.hasCut;
+function commit() { clearTimeout(_ct); _pending = false; if (!doc) return; const snap = { S: cloneS(S), base: doc.base, mask: doc.mask, src: doc.src, hasCut: doc.hasCut }; if (hist.i >= 0 && sig(hist.st[hist.i]) === sig(snap)) return; hist.st = hist.st.slice(0, hist.i + 1); hist.st.push(snap); if (hist.st.length > 40) hist.st.shift(); hist.i = hist.st.length - 1; histBtns(); }
 function restore(h) { const c = cloneS(h.S); Object.keys(c).forEach(k => S[k] = c[k]); doc.base = h.base; doc.mask = h.mask; doc.src = h.src; doc.hasCut = h.hasCut; doc._bk = null; sel = sel && sel !== 'subject' ? S.layers.find(l => l.id === sel.id) || null : sel; refresh(doc); syncUI(); draw(); }
-function undo() { if (hist.i > 0) { hist.i--; restore(hist.st[hist.i]); histBtns(); } }
-function redo() { if (hist.i < hist.st.length - 1) { hist.i++; restore(hist.st[hist.i]); histBtns(); } }
+function undo() { flushCommit(); if (hist.i > 0) { hist.i--; restore(hist.st[hist.i]); histBtns(); } }
+function redo() { flushCommit(); if (hist.i < hist.st.length - 1) { hist.i++; restore(hist.st[hist.i]); histBtns(); } }
 function histBtns() { $('undo').disabled = hist.i <= 0; $('redo').disabled = hist.i >= hist.st.length - 1; }
 
 // ---------------- start / load ----------------
@@ -294,8 +298,11 @@ const SIZES = [
   ['Ratios', [['r11', '1:1 (2000 px)', 2000, 2000], ['r45', '4:5', 1600, 2000], ['r34', '3:4', 1500, 2000], ['r43', '4:3', 2000, 1500], ['r169', '16:9', 1920, 1080], ['r916', '9:16', 1080, 1920]]]];
 const sizeSel = $('sizePreset'), SZ = {};
 SIZES.forEach(([g, items]) => { const og = document.createElement('optgroup'); og.label = g; items.forEach(([k, l, w, h]) => { SZ[k] = [w || 0, h || 0]; const o = document.createElement('option'); o.value = k; o.textContent = l; og.appendChild(o); }); sizeSel.appendChild(og); });
-sizeSel.onchange = () => { const k = sizeSel.value; S.size.preset = k; if (k === 'custom') { S.size.w = +$('cw').value; S.size.h = +$('ch').value; } else [S.size.w, S.size.h] = SZ[k]; $('customRow').hidden = k !== 'custom'; draw(); commit(); };
-['cw', 'ch'].forEach(id => $(id).oninput = () => { const w = +$('cw').value, h = +$('ch').value; if (w < 16 || h < 16) return; S.size.w = Math.min(8000, w); S.size.h = Math.min(8000, h); draw(); commitSoon(); });
+sizeSel.onchange = () => { const k = sizeSel.value; S.size.preset = k; if (k === 'custom') { S.size.w = +$('cw').value; S.size.h = +$('ch').value; } else [S.size.w, S.size.h] = SZ[k]; $('customRow').hidden = k !== 'custom'; sizeInfo(); draw(); commit(); };
+// a burst = one pass over W and H; coming back to a field already finished in this burst starts a new step
+const burst = { left: new Set() };
+['cw', 'ch'].forEach(id => $(id).addEventListener('blur', () => { if (_pending) burst.left.add(id); }));
+['cw', 'ch'].forEach(id => $(id).oninput = () => { if (!_pending) burst.left.clear(); else if (burst.left.has(id)) { flushCommit(); burst.left.clear(); } const w = +$('cw').value, h = +$('ch').value; if (w < 16 || h < 16) return; S.size.w = Math.min(8000, w); S.size.h = Math.min(8000, h); sizeInfo(); draw(); commitSoon(); });
 function sizeInfo() { if (!doc) return; const [W, H] = outSize(S, doc); $('sizeInfo').textContent = `Output: ${W} × ${H} px`; $('exInfo').textContent = `Output: ${W * EX.up} × ${H * EX.up} px` + (EX.up > 1 ? ' (AI upscaled)' : ''); }
 bind('pad', 'pad'); bind('sjScale', 'subj.s', 100); bind('sjRot', 'subj.rot');
 $('flipH').onclick = () => { S.subj.fx *= -1; draw(); commit(); };
